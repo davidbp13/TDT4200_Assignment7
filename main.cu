@@ -7,6 +7,10 @@ extern "C" {
     #include "libs/bitmap.h"
 }
 
+/* Divide the problem into blocks of BLOCKX x BLOCKY threads */
+#define BLOCKY 8
+#define BLOCKX 8
+
 #define ERROR_EXIT -1
 
 #define cudaErrorCheck(ans) { gpuAssert((ans), __FILE__, __LINE__); }
@@ -89,6 +93,37 @@ void applyFilter(unsigned char **out, unsigned char **in, unsigned int width, un
     }
   }
 }
+
+/************************* GPU Kernel *************************/
+__global__ void device_calculate(unsigned char *out, unsigned char *in, unsigned int width, unsigned int height, int *filter, unsigned int filterDim, float filterFactor) {
+	//A single pixel is assigned to one tread in each of the blocks 
+	int x = blockIdx.x *  blockDim.x + threadIdx.x;
+	int y = blockIdx.y *  blockDim.y + threadIdx.y;
+	
+	//Make sure that only threads with a valid pixel compute
+	if ( (x < width) && (y  < height) ){
+	  unsigned int const filterCenter = (filterDim / 2);
+      int aggregate = 0;
+      for (unsigned int ky = 0; ky < filterDim; ky++) {
+        int nky = filterDim - 1 - ky;
+        for (unsigned int kx = 0; kx < filterDim; kx++) {
+          int nkx = filterDim - 1 - kx;
+
+          int yy = y + (ky - filterCenter);
+          int xx = x + (kx - filterCenter);
+          if (xx >= 0 && xx < (int) width && yy >=0 && yy < (int) height)
+            aggregate += in[xx + yy * height] * filter[nky * filterDim + nkx];
+        }
+      }
+      aggregate *= filterFactor;
+      if (aggregate > 0) {
+        out[x + y * height] = (aggregate > 255) ? 255 : aggregate;
+      } else {
+        out[x + y * height] = 0;
+      }
+  }
+}
+/*************************************************************/
 
 
 void help(char const *exec, char const opt, char const *optarg) {
@@ -199,19 +234,31 @@ int main(int argc, char **argv) {
     return ERROR_EXIT;
   }
 
+  /******************************* Set up device memory *******************************/
+  // Input image
+  unsigned char *imageChannelGPU;
+  cudaErrorCheck( cudaMalloc((void**)&imageChannelGPU, imageChannel->width * imageChannel->height * sizeof(unsigned char)) );
+  
+  // Output image after each iteration
+  unsigned char *processImageChannelGPU;
+  cudaErrorCheck( cudaMalloc((void**)&processImageChannelGPU, imageChannel->width * imageChannel->height * sizeof(unsigned char)) );
+  /************************************************************************************/
 
   //Here we do the actual computation!
   // imageChannel->data is a 2-dimensional array of unsigned char which is accessed row first ([y][x])
   bmpImageChannel *processImageChannel = newBmpImageChannel(imageChannel->width, imageChannel->height);
   for (unsigned int i = 0; i < iterations; i ++) {
+	
+	/*  
+	//CPU code
     applyFilter(processImageChannel->data,
                 imageChannel->data,
                 imageChannel->width,
                 imageChannel->height,
                 (int *)laplacian1Filter, 3, laplacian1FilterFactor
- //               (int *)laplacian2Filter, 3, laplacian2FilterFactor
- //               (int *)laplacian3Filter, 3, laplacian3FilterFactor
- //               (int *)gaussianFilter, 5, gaussianFilterFactor
+                //(int *)laplacian2Filter, 3, laplacian2FilterFactor
+                //(int *)laplacian3Filter, 3, laplacian3FilterFactor
+                //(int *)gaussianFilter, 5, gaussianFilterFactor
                 );
     //Swap the data pointers
     unsigned char ** tmp = processImageChannel->data;
@@ -219,9 +266,37 @@ int main(int argc, char **argv) {
     imageChannel->data = tmp;
     unsigned char * tmp_raw = processImageChannel->rawdata;
     processImageChannel->rawdata = imageChannel->rawdata;
-    imageChannel->rawdata = tmp_raw;
+    imageChannel->rawdata = tmp_raw;*/
+    
+    //GPU code
+    /******************************* Execute GPU Kernel *******************************/
+	// Move input image to the GPU
+	cudaErrorCheck( cudaMemcpy(imageChannelGPU, imageChannel->rawdata, imageChannel->width * imageChannel->height * sizeof(unsigned char), cudaMemcpyHostToDevice) );
+	
+	// Call the kernel
+	dim3 gridBlock(imageChannel->width/BLOCKX, imageChannel->height/BLOCKY); //Set the number of blocks accordingly to the image size
+	dim3 threadBlock(BLOCKX, BLOCKY); //Each block will have BLOCKX * BLOCKY threads (64 in this case)
+	device_calculate<<<gridBlock,threadBlock>>>(processImageChannelGPU, imageChannelGPU, imageChannel->width, imageChannel->height, (int *)laplacian1Filter, 3, laplacian1FilterFactor
+																																	//(int *)laplacian2Filter, 3, laplacian2FilterFactor
+																																	//(int *)laplacian3Filter, 3, laplacian3FilterFactor
+																																	//(int *)gaussianFilter, 5, gaussianFilterFactor
+																																	);
+	cudaErrorCheck( cudaPeekAtLastError() );
+	cudaErrorCheck( cudaDeviceSynchronize() );
+	
+	// Move GPU result to be used as input for the next iteration
+	cudaErrorCheck( cudaMemcpy(imageChannel->rawdata, processImageChannelGPU, imageChannel->width * imageChannel->height * sizeof(unsigned char), cudaMemcpyDeviceToHost) );
+    /**********************************************************************************/
   }
   freeBmpImageChannel(processImageChannel);
+
+  /******************************* Free device memory *******************************/
+  // Input image
+  cudaErrorCheck( cudaFree(imageChannelGPU) );
+
+  // Output image
+  cudaErrorCheck( cudaFree(processImageChannelGPU) );
+  /**********************************************************************************/
 
   // Map our single color image back to a normal BMP image with 3 color channels
   // mapEqual puts the color value on all three channels the same way
