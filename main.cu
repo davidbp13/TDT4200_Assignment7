@@ -112,14 +112,14 @@ __global__ void device_calculate(unsigned char *out, unsigned char *in, unsigned
           int yy = y + (ky - filterCenter);
           int xx = x + (kx - filterCenter);
           if (xx >= 0 && xx < (int) width && yy >=0 && yy < (int) height)
-            aggregate += in[xx + yy * height] * filter[nky * filterDim + nkx];
+            aggregate += in[xx + yy * width] * filter[nky * filterDim + nkx];
         }
       }
       aggregate *= filterFactor;
       if (aggregate > 0) {
-        out[x + y * height] = (aggregate > 255) ? 255 : aggregate;
+        out[x + y * width] = (aggregate > 255) ? 255 : aggregate;
       } else {
-        out[x + y * height] = 0;
+        out[x + y * width] = 0;
       }
   }
 }
@@ -198,6 +198,11 @@ int main(int argc, char **argv) {
   /*
     End of Parameter parsing!
    */
+  
+  cudaDeviceProp p;
+  cudaSetDevice(0);
+  cudaGetDeviceProperties (&p, 0);
+  printf("Device compute capability: %d.%d\n", p.major, p.minor);
 
   /*
     Create the BMP image and load it from disk.
@@ -239,6 +244,11 @@ int main(int argc, char **argv) {
   unsigned char *imageChannelGPU;
   cudaErrorCheck( cudaMalloc((void**)&imageChannelGPU, imageChannel->width * imageChannel->height * sizeof(unsigned char)) );
   
+  // Filter 
+  int *filterGPU;
+  cudaErrorCheck( cudaMalloc((void**)&filterGPU, 3 * 3 * sizeof(int)) );
+  cudaErrorCheck( cudaMemcpy(filterGPU, laplacian1Filter, 3 * 3 * sizeof(int), cudaMemcpyHostToDevice) );
+  
   // Output image after each iteration
   unsigned char *processImageChannelGPU;
   cudaErrorCheck( cudaMalloc((void**)&processImageChannelGPU, imageChannel->width * imageChannel->height * sizeof(unsigned char)) );
@@ -274,12 +284,12 @@ int main(int argc, char **argv) {
 	cudaErrorCheck( cudaMemcpy(imageChannelGPU, imageChannel->rawdata, imageChannel->width * imageChannel->height * sizeof(unsigned char), cudaMemcpyHostToDevice) );
 	
 	// Call the kernel
-	dim3 gridBlock(imageChannel->width/BLOCKX, imageChannel->height/BLOCKY); //Set the number of blocks accordingly to the image size
+	dim3 gridBlock(ceil(imageChannel->width/BLOCKX), ceil(imageChannel->height/BLOCKY)); //Set the number of blocks accordingly to the image size
 	dim3 threadBlock(BLOCKX, BLOCKY); //Each block will have BLOCKX * BLOCKY threads (64 in this case)
-	device_calculate<<<gridBlock,threadBlock>>>(processImageChannelGPU, imageChannelGPU, imageChannel->width, imageChannel->height, (int *)laplacian1Filter, 3, laplacian1FilterFactor
-																																	//(int *)laplacian2Filter, 3, laplacian2FilterFactor
-																																	//(int *)laplacian3Filter, 3, laplacian3FilterFactor
-																																	//(int *)gaussianFilter, 5, gaussianFilterFactor
+	device_calculate<<<gridBlock,threadBlock>>>(processImageChannelGPU, imageChannelGPU, imageChannel->width, imageChannel->height, filterGPU, 3, laplacian1FilterFactor
+																																	//filterGPU, 3, laplacian2FilterFactor
+																																	//filterGPU, 3, laplacian3FilterFactor
+																																	//filterGPU, 5, gaussianFilterFactor
 																																	);
 	cudaErrorCheck( cudaPeekAtLastError() );
 	cudaErrorCheck( cudaDeviceSynchronize() );
@@ -293,6 +303,9 @@ int main(int argc, char **argv) {
   /******************************* Free device memory *******************************/
   // Input image
   cudaErrorCheck( cudaFree(imageChannelGPU) );
+  
+  // Filter
+  cudaErrorCheck( cudaFree(filterGPU) );
 
   // Output image
   cudaErrorCheck( cudaFree(processImageChannelGPU) );
