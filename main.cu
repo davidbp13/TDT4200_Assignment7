@@ -3,6 +3,7 @@
 #include <string.h>
 #include <getopt.h>
 #include <stdlib.h>
+#include <sys/time.h>
 extern "C" {
     #include "libs/bitmap.h"
 }
@@ -125,6 +126,15 @@ __global__ void device_calculate(unsigned char *out, unsigned char *in, unsigned
 }
 /*************************************************************/
 
+/*
+ * Get system time to microsecond precision (ostensibly, the same as MPI_Wtime),
+ * returns time in seconds
+ */
+double walltime ( void ) {
+	static struct timeval t;
+	gettimeofday ( &t, NULL );
+	return ( t.tv_sec + 1e-6 * t.tv_usec );
+}
 
 void help(char const *exec, char const opt, char const *optarg) {
     FILE *out = stdout;
@@ -199,14 +209,19 @@ int main(int argc, char **argv) {
     End of Parameter parsing!
    */
   
+  // Timing variables
+  double start;
+  double hosttime=0;
+  double devicetime=0;
+
+  // CUDA device properties
   cudaDeviceProp p;
   cudaSetDevice(0);
   cudaGetDeviceProperties (&p, 0);
   printf("Device compute capability: %d.%d\n", p.major, p.minor);
 
-  /*
-    Create the BMP image and load it from disk.
-   */
+  
+  // Create the BMP image and load it from disk.
   bmpImage *image = newBmpImage(0,0);
   if (image == NULL) {
     fprintf(stderr, "Could not allocate new image!\n");
@@ -227,6 +242,14 @@ int main(int argc, char **argv) {
     return ERROR_EXIT;
   }
 
+  // Create a single color channel image. It is easier to work just with one color (CPU reference)
+  bmpImageChannel *referenceImageChannel = newBmpImageChannel(image->width, image->height);
+  if (referenceImageChannel == NULL) {
+    fprintf(stderr, "Could not allocate new reference image channel!\n");
+    freeBmpImage(image);
+    return ERROR_EXIT;
+  }
+
   // Extract from the loaded image an average over all colors - nothing else than
   // a black and white representation
   // extractImageChannel and mapImageChannel need the images to be in the exact
@@ -238,6 +261,42 @@ int main(int argc, char **argv) {
     freeBmpImageChannel(imageChannel);
     return ERROR_EXIT;
   }
+
+  // Extract from the loaded image an average over all colors - nothing else than
+  // a black and white representation
+  // extractImageChannel and mapImageChannel need the images to be in the exact
+  // same dimensions!
+  // Other prepared extraction functions are extractRed, extractGreen, extractBlue
+  if(extractImageChannel(referenceImageChannel, image, extractAverage) != 0) {
+    fprintf(stderr, "Could not extract reference image channel!\n");
+    freeBmpImage(image);
+    freeBmpImageChannel(referenceImageChannel);
+    return ERROR_EXIT;
+  }
+
+  // CPU implementation
+  bmpImageChannel *processImageChannel = newBmpImageChannel(referenceImageChannel->width, referenceImageChannel->height);
+  start=walltime();
+  for (unsigned int i = 0; i < iterations; i ++) {
+    applyFilter(processImageChannel->data,
+                referenceImageChannel->data,
+                referenceImageChannel->width,
+                referenceImageChannel->height,
+                (int *)laplacian1Filter, 3, laplacian1FilterFactor
+                //(int *)laplacian2Filter, 3, laplacian2FilterFactor
+                //(int *)laplacian3Filter, 3, laplacian3FilterFactor
+                //(int *)gaussianFilter, 5, gaussianFilterFactor
+                );
+    //Swap the data pointers
+    unsigned char ** tmp = processImageChannel->data;
+    processImageChannel->data = referenceImageChannel->data;
+    referenceImageChannel->data = tmp;
+    unsigned char * tmp_raw = processImageChannel->rawdata;
+    processImageChannel->rawdata = referenceImageChannel->rawdata;
+    referenceImageChannel->rawdata = tmp_raw;
+  }
+  hosttime+=walltime()-start;  
+  freeBmpImageChannel(processImageChannel);
 
   /******************************* Set up device memory *******************************/
   // Input image
@@ -254,38 +313,17 @@ int main(int argc, char **argv) {
   cudaErrorCheck( cudaMalloc((void**)&processImageChannelGPU, imageChannel->width * imageChannel->height * sizeof(unsigned char)) );
   /************************************************************************************/
 
-  //Here we do the actual computation!
-  // imageChannel->data is a 2-dimensional array of unsigned char which is accessed row first ([y][x])
-  bmpImageChannel *processImageChannel = newBmpImageChannel(imageChannel->width, imageChannel->height);
+  // GPU implementation
+  dim3 gridBlock(ceil(imageChannel->width/BLOCKX), ceil(imageChannel->height/BLOCKY)); //Set the number of blocks accordingly to the image size
+  dim3 threadBlock(BLOCKX, BLOCKY); //Each block will have BLOCKX * BLOCKY threads (64 in this case)
+  start=walltime();
   for (unsigned int i = 0; i < iterations; i ++) {
-	
-	/*  
-	//CPU code
-    applyFilter(processImageChannel->data,
-                imageChannel->data,
-                imageChannel->width,
-                imageChannel->height,
-                (int *)laplacian1Filter, 3, laplacian1FilterFactor
-                //(int *)laplacian2Filter, 3, laplacian2FilterFactor
-                //(int *)laplacian3Filter, 3, laplacian3FilterFactor
-                //(int *)gaussianFilter, 5, gaussianFilterFactor
-                );
-    //Swap the data pointers
-    unsigned char ** tmp = processImageChannel->data;
-    processImageChannel->data = imageChannel->data;
-    imageChannel->data = tmp;
-    unsigned char * tmp_raw = processImageChannel->rawdata;
-    processImageChannel->rawdata = imageChannel->rawdata;
-    imageChannel->rawdata = tmp_raw;*/
-    
-    //GPU code
     /******************************* Execute GPU Kernel *******************************/
 	// Move input image to the GPU
+
 	cudaErrorCheck( cudaMemcpy(imageChannelGPU, imageChannel->rawdata, imageChannel->width * imageChannel->height * sizeof(unsigned char), cudaMemcpyHostToDevice) );
 	
 	// Call the kernel
-	dim3 gridBlock(ceil(imageChannel->width/BLOCKX), ceil(imageChannel->height/BLOCKY)); //Set the number of blocks accordingly to the image size
-	dim3 threadBlock(BLOCKX, BLOCKY); //Each block will have BLOCKX * BLOCKY threads (64 in this case)
 	device_calculate<<<gridBlock,threadBlock>>>(processImageChannelGPU, imageChannelGPU, imageChannel->width, imageChannel->height, filterGPU, 3, laplacian1FilterFactor
 																																	//filterGPU, 3, laplacian2FilterFactor
 																																	//filterGPU, 3, laplacian3FilterFactor
@@ -298,7 +336,7 @@ int main(int argc, char **argv) {
 	cudaErrorCheck( cudaMemcpy(imageChannel->rawdata, processImageChannelGPU, imageChannel->width * imageChannel->height * sizeof(unsigned char), cudaMemcpyDeviceToHost) );
     /**********************************************************************************/
   }
-  freeBmpImageChannel(processImageChannel);
+  devicetime+=walltime()-start;
 
   /******************************* Free device memory *******************************/
   // Input image
@@ -311,6 +349,25 @@ int main(int argc, char **argv) {
   cudaErrorCheck( cudaFree(processImageChannelGPU) );
   /**********************************************************************************/
 
+  // Check if result is correct
+  int errors=0;
+  
+  for(int y=0;y<imageChannel->height;y++) {
+    for(int x=0;x<imageChannel->width;x++) {
+      int diff=referenceImageChannel->rawdata[x + y * imageChannel->width]-imageChannel->rawdata[x + y * imageChannel->width];
+      if(diff<0) diff=-diff;
+      if(diff>1) {
+        if(errors<10) printf("Error on pixel %d %d: expected %d, found %d\n",
+			x,y,referenceImageChannel->rawdata[x + y * imageChannel->width],
+			imageChannel->rawdata[x + y * imageChannel->width]);
+	else if(errors==10) puts("...");
+	  errors++;
+	}
+    }
+  }
+  if(errors>0) printf("Found %d errors.\n",errors);
+  else puts("\nDevice calculations are correct.");
+
   // Map our single color image back to a normal BMP image with 3 color channels
   // mapEqual puts the color value on all three channels the same way
   // other mapping functions are mapRed, mapGreen, mapBlue
@@ -321,13 +378,20 @@ int main(int argc, char **argv) {
     return ERROR_EXIT;
   }
   freeBmpImageChannel(imageChannel);
+  freeBmpImageChannel(referenceImageChannel);
 
-  //Write the image back to disk
+  // Write the image back to disk
   if (saveBmpImage(image, output) != 0) {
     fprintf(stderr, "Could not save output to '%s'!\n", output);
     freeBmpImage(image);
     return ERROR_EXIT;
   };
+
+  // Print timing results
+  printf("\n");
+  printf("Host time: %7.3f ms\n",hosttime*1e3);
+  printf("Device time: %7.3f ms\n",devicetime*1e3);
+  printf("Speedup: %7.3f \n", hosttime/ devicetime);
 
   ret = 0;
   if (input)
