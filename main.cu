@@ -9,8 +9,8 @@ extern "C" {
 }
 
 /* Divide the problem into blocks of BLOCKX x BLOCKY threads */
-#define BLOCKY 8
-#define BLOCKX 8
+#define BLOCKY 32
+#define BLOCKX 32
 
 #define ERROR_EXIT -1
 
@@ -97,13 +97,86 @@ void applyFilter(unsigned char **out, unsigned char **in, unsigned int width, un
 
 /************************* GPU Kernel *************************/
 __global__ void device_calculate(unsigned char *out, unsigned char *in, unsigned int width, unsigned int height, int *filter, unsigned int filterDim, float filterFactor) {
-	//A single pixel is assigned to one tread in each of the blocks 
-	int x = blockIdx.x *  blockDim.x + threadIdx.x;
-	int y = blockIdx.y *  blockDim.y + threadIdx.y;
+  //A single pixel is assigned to one tread in each of the blocks 
+  int x = blockIdx.x *  blockDim.x + threadIdx.x;
+  int y = blockIdx.y *  blockDim.y + threadIdx.y;
 	
-	//Make sure that only threads with a valid pixel compute
-	if ( (x < width) && (y  < height) ){
-	  unsigned int const filterCenter = (filterDim / 2);
+  //Make sure that only threads with a valid pixel compute
+  if ( (x < width) && (y  < height) ){
+    unsigned int const filterCenter = (filterDim / 2);
+    int aggregate = 0;
+    for (unsigned int ky = 0; ky < filterDim; ky++) {
+      int nky = filterDim - 1 - ky;
+      for (unsigned int kx = 0; kx < filterDim; kx++) {
+        int nkx = filterDim - 1 - kx;
+
+        int yy = y + (ky - filterCenter);
+        int xx = x + (kx - filterCenter);
+        if (xx >= 0 && xx < (int) width && yy >=0 && yy < (int) height)
+          aggregate += in[xx + yy * width] * filter[nky * filterDim + nkx];
+      }
+    }
+    aggregate *= filterFactor;
+    if (aggregate > 0) {
+      out[x + y * width] = (aggregate > 255) ? 255 : aggregate;
+    } else {
+      out[x + y * width] = 0;
+    }
+  }
+}
+
+__global__ void device_shared_calculate(unsigned char *out, unsigned char *in, unsigned int width, unsigned int height, int *filter, unsigned int filterDim, float filterFactor) {
+  /*
+  1. Move pixels of the block into shared memory.
+  2. Compute over the shared memory. When pixels from another block are needed to compute, get them from global memory.
+  */
+  
+  //A single pixel is assigned to one tread in each of the blocks 
+  int x = blockIdx.x *  blockDim.x + threadIdx.x;
+  int y = blockIdx.y *  blockDim.y + threadIdx.y;
+  
+  // Move pixels into shared memory
+  extern __shared__ unsigned char in_shared[];
+  in_shared[threadIdx.x + threadIdx.y *  blockDim.x] = in[x + y * width];
+
+  __syncthreads();
+
+  // Move filter into shared memory
+  /*extern __shared__ int filter_shared[];
+  
+  for (int i = 0; i < filterDim*filterDim; i++){
+    filter_shared[i] = filter[i];
+  }
+
+  __syncthreads();*/
+
+  unsigned int const filterCenter = (filterDim / 2);
+  	
+  //Make sure that only threads with a valid pixel compute
+  if ( (x < width) && (y  < height) ){
+    // If the pixel needs pixels only from its block, use shared memory
+    if ( !(threadIdx.x == 0 || threadIdx.x == (blockDim.x-1) || threadIdx.y == 0 || threadIdx.y == (blockDim.y-1)) ){  
+      int aggregate = 0;
+      for (unsigned int ky = 0; ky < filterDim; ky++) {
+        int nky = filterDim - 1 - ky;
+        for (unsigned int kx = 0; kx < filterDim; kx++) {
+          int nkx = filterDim - 1 - kx;
+
+          int yy = threadIdx.y + (ky - filterCenter);
+          int xx = threadIdx.x + (kx - filterCenter);
+          if (xx >= 0 && xx < blockDim.x && yy >=0 && yy < blockDim.y)
+            aggregate += in_shared[xx + yy *  blockDim.x] * filter[nky * filterDim + nkx];
+        }
+      }
+      aggregate *= filterFactor;
+      if (aggregate > 0) {
+        out[x + y * width] = (aggregate > 255) ? 255 : aggregate;
+      } else {
+        out[x + y * width] = 0;
+      }
+    }
+    // If the pixel needs pixels from other blocks, use global memory 
+    else{
       int aggregate = 0;
       for (unsigned int ky = 0; ky < filterDim; ky++) {
         int nky = filterDim - 1 - ky;
@@ -113,7 +186,7 @@ __global__ void device_calculate(unsigned char *out, unsigned char *in, unsigned
           int yy = y + (ky - filterCenter);
           int xx = x + (kx - filterCenter);
           if (xx >= 0 && xx < (int) width && yy >=0 && yy < (int) height)
-            aggregate += in[xx + yy * width] * filter[nky * filterDim + nkx];
+            aggregate += in[xx + yy *  width] * filter[nky * filterDim + nkx];
         }
       }
       aggregate *= filterFactor;
@@ -122,6 +195,54 @@ __global__ void device_calculate(unsigned char *out, unsigned char *in, unsigned
       } else {
         out[x + y * width] = 0;
       }
+      
+    }    
+  }
+}
+
+__global__ void device_shared2_calculate(unsigned char *out, unsigned char *in, unsigned int width, unsigned int height, int *filter, unsigned int filterDim, float filterFactor) {
+  /*
+  1. Move pixels of the block into shared memory.
+  2. Compute over the shared memory. When pixels from another block are needed to compute, get them from global memory.
+  */
+  
+  //A single pixel is assigned to one tread in each of the blocks 
+  int x = blockIdx.x *  blockDim.x + threadIdx.x;
+  int y = blockIdx.y *  blockDim.y + threadIdx.y;
+
+  // Move filter into shared memory
+  extern __shared__ int filter_shared[];
+  
+  for (int i = 0; i < filterDim*filterDim; i++){
+    filter_shared[i] = filter[i];
+  }
+
+  __syncthreads();
+
+  unsigned int const filterCenter = (filterDim / 2);
+  	
+  //Make sure that only threads with a valid pixel compute
+  if ( (x < width) && (y  < height) ){
+
+      int aggregate = 0;
+      for (unsigned int ky = 0; ky < filterDim; ky++) {
+        int nky = filterDim - 1 - ky;
+        for (unsigned int kx = 0; kx < filterDim; kx++) {
+          int nkx = filterDim - 1 - kx;
+
+          int yy = y + (ky - filterCenter);
+          int xx = x + (kx - filterCenter);
+          if (xx >= 0 && xx < (int) width && yy >=0 && yy < (int) height)
+            aggregate += in[xx + yy *  width] * filter_shared[nky * filterDim + nkx];
+        }
+      }
+      aggregate *= filterFactor;
+      if (aggregate > 0) {
+        out[x + y * width] = (aggregate > 255) ? 255 : aggregate;
+      } else {
+        out[x + y * width] = 0;
+      }
+          
   }
 }
 /*************************************************************/
@@ -131,28 +252,28 @@ __global__ void device_calculate(unsigned char *out, unsigned char *in, unsigned
  * returns time in seconds
  */
 double walltime ( void ) {
-	static struct timeval t;
-	gettimeofday ( &t, NULL );
-	return ( t.tv_sec + 1e-6 * t.tv_usec );
+  static struct timeval t;
+  gettimeofday ( &t, NULL );
+  return ( t.tv_sec + 1e-6 * t.tv_usec );
 }
 
 void help(char const *exec, char const opt, char const *optarg) {
-    FILE *out = stdout;
-    if (opt != 0) {
-        out = stderr;
-        if (optarg) {
-            fprintf(out, "Invalid parameter - %c %s\n", opt, optarg);
-        } else {
-            fprintf(out, "Invalid parameter - %c\n", opt);
-        }
+  FILE *out = stdout;
+  if (opt != 0) {
+    out = stderr;
+    if (optarg) {
+      fprintf(out, "Invalid parameter - %c %s\n", opt, optarg);
+    } else {
+      fprintf(out, "Invalid parameter - %c\n", opt);
     }
-    fprintf(out, "%s [options] <input-bmp> <output-bmp>\n", exec);
-    fprintf(out, "\n");
-    fprintf(out, "Options:\n");
-    fprintf(out, "  -i, --iterations <iterations>    number of iterations (1)\n");
+  }
+  fprintf(out, "%s [options] <input-bmp> <output-bmp>\n", exec);
+  fprintf(out, "\n");
+  fprintf(out, "Options:\n");
+  fprintf(out, "  -i, --iterations <iterations>    number of iterations (1)\n");
 
-    fprintf(out, "\n");
-    fprintf(out, "Example: %s in.bmp out.bmp -i 10000\n", exec);
+  fprintf(out, "\n");
+  fprintf(out, "Example: %s in.bmp out.bmp -i 10000\n", exec);
 }
 
 int main(int argc, char **argv) {
@@ -302,7 +423,8 @@ int main(int argc, char **argv) {
   // Input image
   unsigned char *imageChannelGPU;
   cudaErrorCheck( cudaMalloc((void**)&imageChannelGPU, imageChannel->width * imageChannel->height * sizeof(unsigned char)) );
-  
+  cudaErrorCheck( cudaMemcpy(imageChannelGPU, imageChannel->rawdata, imageChannel->width * imageChannel->height * sizeof(unsigned char), cudaMemcpyHostToDevice) );
+
   // Filter 
   int *filterGPU;
   cudaErrorCheck( cudaMalloc((void**)&filterGPU, 3 * 3 * sizeof(int)) );
@@ -313,30 +435,45 @@ int main(int argc, char **argv) {
   cudaErrorCheck( cudaMalloc((void**)&processImageChannelGPU, imageChannel->width * imageChannel->height * sizeof(unsigned char)) );
   /************************************************************************************/
 
+  /******************************* Execute GPU Kernel *******************************/
   // GPU implementation
   dim3 gridBlock(ceil(imageChannel->width/BLOCKX), ceil(imageChannel->height/BLOCKY)); //Set the number of blocks accordingly to the image size
   dim3 threadBlock(BLOCKX, BLOCKY); //Each block will have BLOCKX * BLOCKY threads (64 in this case)
   start=walltime();
   for (unsigned int i = 0; i < iterations; i ++) {
-    /******************************* Execute GPU Kernel *******************************/
-	// Move input image to the GPU
-
-	cudaErrorCheck( cudaMemcpy(imageChannelGPU, imageChannel->rawdata, imageChannel->width * imageChannel->height * sizeof(unsigned char), cudaMemcpyHostToDevice) );
-	
-	// Call the kernel
-	device_calculate<<<gridBlock,threadBlock>>>(processImageChannelGPU, imageChannelGPU, imageChannel->width, imageChannel->height, filterGPU, 3, laplacian1FilterFactor
+    // Call the kernel
+    device_calculate<<<gridBlock,threadBlock>>>(processImageChannelGPU, imageChannelGPU, imageChannel->width, imageChannel->height, filterGPU, 3, laplacian1FilterFactor
 																																	//filterGPU, 3, laplacian2FilterFactor
 																																	//filterGPU, 3, laplacian3FilterFactor
 																																	//filterGPU, 5, gaussianFilterFactor
 																																	);
-	cudaErrorCheck( cudaPeekAtLastError() );
-	cudaErrorCheck( cudaDeviceSynchronize() );
+
+  /*
+    device_shared_calculate<<<gridBlock,threadBlock, (BLOCKX * BLOCKY * sizeof(unsigned char))>>>(processImageChannelGPU, imageChannelGPU, imageChannel->width, imageChannel->height, filterGPU, 3, laplacian1FilterFactor
+																																	//filterGPU, 3, laplacian2FilterFactor
+																																	//filterGPU, 3, laplacian3FilterFactor
+																																	//filterGPU, 5, gaussianFilterFactor
+																																	);
+
+
+  device_shared2_calculate<<<gridBlock,threadBlock, (3 * 3 * sizeof(int))>>>(processImageChannelGPU, imageChannelGPU, imageChannel->width, imageChannel->height, filterGPU, 3, laplacian1FilterFactor
+																																	//filterGPU, 3, laplacian2FilterFactor
+																																	//filterGPU, 3, laplacian3FilterFactor
+																																	//filterGPU, 5, gaussianFilterFactor
+																																	);
+    */
+    cudaErrorCheck( cudaPeekAtLastError() );
+    cudaErrorCheck( cudaDeviceSynchronize() );
 	
-	// Move GPU result to be used as input for the next iteration
-	cudaErrorCheck( cudaMemcpy(imageChannel->rawdata, processImageChannelGPU, imageChannel->width * imageChannel->height * sizeof(unsigned char), cudaMemcpyDeviceToHost) );
-    /**********************************************************************************/
+    // Move GPU result to be used as input for the next iteration
+    cudaErrorCheck( cudaMemcpy(imageChannelGPU, processImageChannelGPU, imageChannel->width * imageChannel->height * sizeof(unsigned char), cudaMemcpyDeviceToDevice) );
+    
   }
   devicetime+=walltime()-start;
+  
+  // Get results from the GPU
+  cudaErrorCheck( cudaMemcpy(imageChannel->rawdata, processImageChannelGPU, imageChannel->width * imageChannel->height * sizeof(unsigned char), cudaMemcpyDeviceToHost) );
+  /**********************************************************************************/  
 
   /******************************* Free device memory *******************************/
   // Input image
@@ -357,9 +494,9 @@ int main(int argc, char **argv) {
       int diff=referenceImageChannel->rawdata[x + y * imageChannel->width]-imageChannel->rawdata[x + y * imageChannel->width];
       if(diff<0) diff=-diff;
       if(diff>1) {
-        if(errors<10) printf("Error on pixel %d %d: expected %d, found %d\n",
-			x,y,referenceImageChannel->rawdata[x + y * imageChannel->width],
-			imageChannel->rawdata[x + y * imageChannel->width]);
+        if(errors<10) printf("Error on pixel %d %d: expected %d, found %d\n", x,y,
+			     referenceImageChannel->rawdata[x + y * imageChannel->width],
+			     imageChannel->rawdata[x + y * imageChannel->width]);
 	else if(errors==10) puts("...");
 	  errors++;
 	}
