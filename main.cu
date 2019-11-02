@@ -137,18 +137,9 @@ __global__ void device_shared_calculate(unsigned char *out, unsigned char *in, u
   
   // Move pixels into shared memory
   extern __shared__ unsigned char in_shared[];
-  in_shared[threadIdx.x + threadIdx.y *  blockDim.x] = in[x + y * width];
+  in_shared[(threadIdx.x + threadIdx.y *  blockDim.x)] = in[x + y * width];
 
   __syncthreads();
-
-  // Move filter into shared memory
-  /*extern __shared__ int filter_shared[];
-  
-  for (int i = 0; i < filterDim*filterDim; i++){
-    filter_shared[i] = filter[i];
-  }
-
-  __syncthreads();*/
 
   unsigned int const filterCenter = (filterDim / 2);
   	
@@ -165,7 +156,7 @@ __global__ void device_shared_calculate(unsigned char *out, unsigned char *in, u
           int yy = threadIdx.y + (ky - filterCenter);
           int xx = threadIdx.x + (kx - filterCenter);
           if (xx >= 0 && xx < blockDim.x && yy >=0 && yy < blockDim.y)
-            aggregate += in_shared[xx + yy *  blockDim.x] * filter[nky * filterDim + nkx];
+            aggregate += in_shared[(xx + yy *  blockDim.x)] * filter[nky * filterDim + nkx];
         }
       }
       aggregate *= filterFactor;
@@ -213,8 +204,12 @@ __global__ void device_shared2_calculate(unsigned char *out, unsigned char *in, 
   // Move filter into shared memory
   extern __shared__ int filter_shared[];
   
+  /*
   for (int i = 0; i < filterDim*filterDim; i++){
     filter_shared[i] = filter[i];
+  }*/
+  if (threadIdx.x + threadIdx.y *  blockDim.x < filterDim * filterDim){
+    filter_shared[threadIdx.x + threadIdx.y *  blockDim.x] = filter[threadIdx.x + threadIdx.y *  blockDim.x];
   }
 
   __syncthreads();
@@ -257,6 +252,7 @@ __global__ void device_shared3_calculate(unsigned char *out, unsigned char *in, 
   int y = blockIdx.y *  blockDim.y + threadIdx.y;
   
   extern __shared__ unsigned char shared_array[];
+  
   // Move pixels into shared memory
   unsigned char* in_shared = (unsigned char*) shared_array;
   in_shared[threadIdx.x + threadIdx.y *  blockDim.x] = in[x + y * width];
@@ -266,8 +262,8 @@ __global__ void device_shared3_calculate(unsigned char *out, unsigned char *in, 
   // Move filter into shared memory
   int* filter_shared = (int*)&shared_array[blockDim.x*blockDim.y];
   
-  for (int i = 0; i < filterDim*filterDim; i++){
-    filter_shared[i] = filter[i];
+  if (threadIdx.x + threadIdx.y *  blockDim.x < filterDim * filterDim){
+    filter_shared[threadIdx.x + threadIdx.y *  blockDim.x] = filter[threadIdx.x + threadIdx.y *  blockDim.x];
   }
 
   __syncthreads();
@@ -512,8 +508,8 @@ int main(int argc, char **argv) {
     // Call the kernel (Use comments to select between the basic GPU kernel and the shared memory GPU kernel
     //device_calculate<<<gridBlock,threadBlock>>>(processImageChannelGPU, imageChannelGPU, imageChannel->width, imageChannel->height, filterGPU, 3, laplacian1FilterFactor);
     //device_shared_calculate<<<gridBlock,threadBlock, (BLOCKX * BLOCKY * sizeof(unsigned char))>>>(processImageChannelGPU, imageChannelGPU, imageChannel->width, imageChannel->height, filterGPU, 3, laplacian1FilterFactor);
-    //device_shared2_calculate<<<gridBlock,threadBlock, (3 * 3 * sizeof(int))>>>(processImageChannelGPU, imageChannelGPU, imageChannel->width, imageChannel->height, filterGPU, 3, laplacian1FilterFactor);
-    device_shared3_calculate<<<gridBlock,threadBlock, (BLOCKX * BLOCKY * sizeof(unsigned char)) + (3 * 3 * sizeof(int))>>>(processImageChannelGPU, imageChannelGPU, imageChannel->width, imageChannel->height, filterGPU, 3, laplacian1FilterFactor);
+    device_shared2_calculate<<<gridBlock,threadBlock, (3 * 3 * sizeof(int))>>>(processImageChannelGPU, imageChannelGPU, imageChannel->width, imageChannel->height, filterGPU, 3, laplacian1FilterFactor);
+    //device_shared3_calculate<<<gridBlock,threadBlock, (BLOCKX * BLOCKY * sizeof(unsigned char)) + (3 * 3 * sizeof(int))>>>(processImageChannelGPU, imageChannelGPU, imageChannel->width, imageChannel->height, filterGPU, 3, laplacian1FilterFactor);
     
     // Check for errors in the kernel execution
     cudaErrorCheck( cudaPeekAtLastError() );
