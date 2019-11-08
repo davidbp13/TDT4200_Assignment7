@@ -9,8 +9,8 @@ extern "C" {
 }
 
 /* Divide the problem into blocks of BLOCKX x BLOCKY threads */
-#define BLOCKY 16
-#define BLOCKX 16
+#define BLOCKY 32
+#define BLOCKX 32
 
 #define ERROR_EXIT -1
 
@@ -125,12 +125,7 @@ __global__ void device_calculate(unsigned char *out, unsigned char *in, unsigned
   }
 }
 
-__global__ void device_shared_calculate(unsigned char *out, unsigned char *in, unsigned int width, unsigned int height, int *filter, unsigned int filterDim, float filterFactor) {
-  /*
-  1. Move pixels of the block into shared memory.
-  2. Compute over the shared memory. When pixels from another block are needed to compute, get them from global memory.
-  */
-  
+__global__ void device_shareInput_calculate(unsigned char *out, unsigned char *in, unsigned int width, unsigned int height, int *filter, unsigned int filterDim, float filterFactor) {
   //A single pixel is assigned to one tread in each of the blocks 
   int x = blockIdx.x *  blockDim.x + threadIdx.x;
   int y = blockIdx.y *  blockDim.y + threadIdx.y;
@@ -191,12 +186,7 @@ __global__ void device_shared_calculate(unsigned char *out, unsigned char *in, u
   }
 }
 
-__global__ void device_shared2_calculate(unsigned char *out, unsigned char *in, unsigned int width, unsigned int height, int *filter, unsigned int filterDim, float filterFactor) {
-  /*
-  1. Move pixels of the block into shared memory.
-  2. Compute over the shared memory. When pixels from another block are needed to compute, get them from global memory.
-  */
-  
+__global__ void device_shareFilter_calculate(unsigned char *out, unsigned char *in, unsigned int width, unsigned int height, int *filter, unsigned int filterDim, float filterFactor) { 
   //A single pixel is assigned to one tread in each of the blocks 
   int x = blockIdx.x *  blockDim.x + threadIdx.x;
   int y = blockIdx.y *  blockDim.y + threadIdx.y;
@@ -241,12 +231,7 @@ __global__ void device_shared2_calculate(unsigned char *out, unsigned char *in, 
   }
 }
 
-__global__ void device_shared3_calculate(unsigned char *out, unsigned char *in, unsigned int width, unsigned int height, int *filter, unsigned int filterDim, float filterFactor) {
-  /*
-  1. Move pixels of the block into shared memory.
-  2. Compute over the shared memory. When pixels from another block are needed to compute, get them from global memory.
-  */
-  
+__global__ void device_shareInputandFilter_calculate(unsigned char *out, unsigned char *in, unsigned int width, unsigned int height, int *filter, unsigned int filterDim, float filterFactor) {
   //A single pixel is assigned to one tread in each of the blocks 
   int x = blockIdx.x *  blockDim.x + threadIdx.x;
   int y = blockIdx.y *  blockDim.y + threadIdx.y;
@@ -506,10 +491,18 @@ int main(int argc, char **argv) {
   start=walltime();
   for (unsigned int i = 0; i < iterations; i ++) {
     // Call the kernel (Use comments to select between the basic GPU kernel and the shared memory GPU kernel
+	
+    //Simple GPU kernel
     //device_calculate<<<gridBlock,threadBlock>>>(processImageChannelGPU, imageChannelGPU, imageChannel->width, imageChannel->height, filterGPU, 3, laplacian1FilterFactor);
-    //device_shared_calculate<<<gridBlock,threadBlock, (BLOCKX * BLOCKY * sizeof(unsigned char))>>>(processImageChannelGPU, imageChannelGPU, imageChannel->width, imageChannel->height, filterGPU, 3, laplacian1FilterFactor);
-    device_shared2_calculate<<<gridBlock,threadBlock, (3 * 3 * sizeof(int))>>>(processImageChannelGPU, imageChannelGPU, imageChannel->width, imageChannel->height, filterGPU, 3, laplacian1FilterFactor);
-    //device_shared3_calculate<<<gridBlock,threadBlock, (BLOCKX * BLOCKY * sizeof(unsigned char)) + (3 * 3 * sizeof(int))>>>(processImageChannelGPU, imageChannelGPU, imageChannel->width, imageChannel->height, filterGPU, 3, laplacian1FilterFactor);
+
+    // GPU kernel with only input array in shared memory
+    //device_shareInput_calculate<<<gridBlock,threadBlock, (BLOCKX * BLOCKY * sizeof(unsigned char))>>>(processImageChannelGPU, imageChannelGPU, imageChannel->width, imageChannel->height, filterGPU, 3, laplacian1FilterFactor);
+
+    // GPU kernel with only filter in shared memory
+    //device_shareFilter_calculate<<<gridBlock,threadBlock, (3 * 3 * sizeof(int))>>>(processImageChannelGPU, imageChannelGPU, imageChannel->width, imageChannel->height, filterGPU, 3, laplacian1FilterFactor);
+   
+    // GPU kernel with both input and filter in GPU memory
+    device_shareInputandFilter_calculate<<<gridBlock,threadBlock, (BLOCKX * BLOCKY * sizeof(unsigned char)) + (3 * 3 * sizeof(int))>>>(processImageChannelGPU, imageChannelGPU, imageChannel->width, imageChannel->height, filterGPU, 3, laplacian1FilterFactor);
     
     // Check for errors in the kernel execution
     cudaErrorCheck( cudaPeekAtLastError() );
